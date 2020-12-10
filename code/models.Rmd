@@ -1,0 +1,257 @@
+---
+title: "models"
+author: "Jingyi Niu"
+date: "2020/12/10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(caret)
+library(lme4)
+library(xgboost)
+library(lubridate)
+library(countrycode)
+library(highcharter)
+library(magrittr)
+library(tidyverse)
+library(readr)
+library(data.table)
+```
+
+## Data Processing
+
+```{r}
+train <- fread("train_df.csv")
+test <- fread("test_df.csv")
+
+#reduce size of dataset
+
+drop <- c("deviceCategory", "continent", "subContinent", "region", "metro", "city", "campaign","networkDomain", "source", "sessionQualityDim", "referralPath","value","campaignCode")
+
+train$transactionRevenue <- log1p(train$transactionRevenue*1000000)
+test$transactionRevenue <- log1p(test$transactionRevenue*1000000)
+train <- train %>% select(-drop)
+test <- test %>% select(-drop)
+
+train[is.na(train)] <- 0
+test[is.na(test)] <- 0
+summary(train)
+
+revenue_convert<-0
+train<-data.frame(train,revenue_convert)
+train$revenue_convert[train$transactionRevenue!=0]<-1
+test<-data.frame(test,revenue_convert)
+test$revenue_convert[test$transactionRevenue!=0]<-1
+
+train_Y<-train[train$revenue_convert==1,]
+train_N<-train[train$revenue_convert==0,]
+test_Y<-test[test$revenue_convert==1,]
+test_N<-test[test$revenue_convert==0,]
+smp_size_Y <- floor(0.1*nrow(train_Y))
+smp_size_N <- floor(0.1*nrow(train_N))
+smp_size_y <- floor(0.1*nrow(test_Y))
+smp_size_n <- floor(0.1*nrow(test_N))
+
+set.seed(123)
+train.ind_Y <- sample(seq_len(nrow(train_Y)), size = smp_size_Y)
+train.ind_N <- sample(seq_len(nrow(train_N)), size = smp_size_N)
+test.ind_Y <- sample(seq_len(nrow(test_Y)), size = smp_size_y)
+test.ind_N <-sample(seq_len(nrow(test_N)), size = smp_size_n)
+train_Y <- train_Y[train.ind_Y,]
+train_N <- train_N[train.ind_N,]
+test_Y <-test_Y[-test.ind_Y,]
+test_N<-test_N[-test.ind_N,]
+train_new<-rbind(train_Y,train_N)
+test_new<-rbind(test_Y,test_N)
+#write.csv(train_new, "train_new.csv")
+#write.csv(test_new, "test_new.csv")
+smp_size <- floor(0.1*nrow(test_new))
+test_size <- sample(seq_len(nrow(test_new)), size = smp_size)
+test_new <- test_new[test_size,]
+
+train_new$country[which(train_new$country =="United States")] <- 1
+train_new$country[which(train_new$country != 1)] <- 0
+test_new$country[which(test_new$country =="United States")] <- 1
+test_new$country[which(test_new$country != 1)] <- 0
+
+train_new <- train_new %>% filter(browser=="Chrome"|browser=="Safari"|
+                                  browser=="Firefox"|browser=="Internet Explorer"|
+                                  browser=="Edge") 
+
+test_new <- test_new %>% filter(browser=="Chrome"|browser=="Safari"|
+                                  browser=="Firefox"|browser=="Internet Explorer"|
+                                  browser=="Edge") 
+train_new <- train_new %>% filter(operatingSystem =="ChromeOS"|operatingSystem=="Macintosh"|
+                                operatingSystem=="Linux"|operatingSystem=="iOS"|operatingSystem=="Windows"|
+                                operatingSystem=="Android")
+test_new <- test_new %>% filter(operatingSystem =="ChromeOS"|operatingSystem=="Macintosh"|
+                                operatingSystem=="Linux"|operatingSystem=="iOS"|operatingSystem=="Windows"|
+                                operatingSystem=="Android")
+write.csv(train_new, "train_new.csv")
+write.csv(test_new, "test_new.csv")
+```
+
+## Linear Mixed Model
+
+
+
+```{r}
+
+m_lmm0 <- lmer(transactionRevenue~ (1|fullVisitorId), data = train_new)
+bg_var <- summary(m_lmm0)$varcor$fullVisitorId[1]
+resid_var <- attr(summary(m_lmm0)$varcor, "sc")^2
+
+
+m_lmm1 <- update(m_lmm0, transactionRevenue ~ scale(pageviews) + (1|fullVisitorId))
+m_lmm2 <- update(m_lmm0, transactionRevenue ~ scale(pageviews) + (1|fullVisitorId))
+m_lmm3 <- update(m_lmm0, transactionRevenue ~ scale(pageviews) + scale(visitNumber) + (1|fullVisitorId))
+m_lmm4 <- update(m_lmm0, transactionRevenue ~ scale(pageviews) + scale(visitNumber) + factor(channelGrouping) + (1|fullVisitorId))
+m_lmm5 <- update(m_lmm0, transactionRevenue ~ scale(pageviews) + scale(visitNumber) + factor(channelGrouping) + factor(browser) + (1|fullVisitorId))
+m_lmm6 <- update(m_lmm0, transactionRevenue ~ scale(pageviews) + scale(visitNumber) + factor(channelGrouping) + factor(browser) + factor(operatingSystem) + factor(isMobile) + (1|fullVisitorId))
+m_lmm7 <- update(m_lmm0, transactionRevenue ~ scale(pageviews) + scale(visitNumber) + factor(channelGrouping) + factor(browser) + factor(operatingSystem) + factor(isMobile) + factor(country) + (1|fullVisitorId))
+anova(m_lmm0, m_lmm1, m_lmm2, m_lmm3, m_lmm4, m_lmm5, m_lmm6, m_lmm7)
+summary(m_lmm7)
+
+p1<-plot(fitted(m_lmm7),resid(m_lmm7),col="blue")
+p2<-qqnorm(resid(m_lmm7))
+
+test_new[is.na(test_new)] <- 0
+pred_lmm <- predict(m_lmm7)
+RMSE(train_new$transactionRevenue, pred_lmm)
+RMSE(test_new$transactionRevenue, pred_lmm)
+```
+
+## Light GB
+```{r}
+library(lightgbm)
+# data
+library(data.table)
+Train_all <- fread("train_new.csv")
+Train_all$fullVisitorId=as.character(Train_all$fullVisitorId)
+Train_all[is.na(Train_all)] <- 0  
+Train_all$isMobile=as.factor(Train_all$isMobile)
+Train_all$isTrueDirect=as.factor(Train_all$isTrueDirect)
+Train_all$country=as.factor(Train_all$country)
+
+Train_all$browser_n=as.factor(Train_all$browser_n)
+Train_all$operatingSystem=as.factor(Train_all$operatingSystem)
+
+
+Test_all <- fread("test_new.csv")
+Test_all$fullVisitorId=as.character(Test_all$fullVisitorId)
+Test_all[is.na(Test_all)] <- 0 
+Test_all$isMobile=as.factor(Test_all$isMobile)
+Test_all$isTrueDirect=as.factor(Test_all$isTrueDirect)
+Test_all$country=as.factor(Test_all$country)
+
+Test_all$browser_n=as.factor(Test_all$browser_n)
+Test_all$operatingSystem=as.factor(Test_all$operatingSystem)
+
+
+T_lgb <- Train_all %>%
+  mutate(revenue=log(transactionRevenue+1)) %>%
+  select(revenue,visitNumber, isMobile, country, pageviews, bounces, newVisits, timeOnSite, isTrueDirect, browser, operatingSystem) %>%
+  mutate_if(is.factor,as.integer) %>%
+  glimpse()
+
+Tst_lgb <- Test_all %>%
+  mutate(revenue=log(transactionRevenue+1)) %>%
+  select(revenue,visitNumber, isMobile, country, pageviews, bounces, newVisits, timeOnSite, isTrueDirect, browser, operatingSystem)%>%
+  mutate_if(is.factor,as.integer) %>%
+  glimpse()
+
+train_lgb <- T_lgb %>%
+  select(-revenue)
+test_lgb <- Tst_lgb %>%
+  select(-revenue)
+
+trainLabel <- T_lgb$revenue
+testLabel <- Tst_lgb$revenue
+categorical_feature <- c("isMobile", "country","newVisits", "isTrueDirect", "browser", "operatingSystem")
+
+train <- lgb.Dataset(as.matrix(train_lgb),label=trainLabel,categorical_feature=categorical_feature)
+test <- lgb.Dataset(as.matrix(test_lgb),label=testLabel, categorical_feature=categorical_feature)
+
+params <- list(objective="regression",metric="rmse",learning_rate=0.01)
+
+lgb.model <- lgb.train(params=params,data=train,valids=list(val=test),learning_rate=0.01,nrounds=5000,verbose=1,early_stopping_rounds=50,eval_freq=1000)
+
+lgb.model$best_score
+
+imp <- lgb.importance(lgb.model,percentage=TRUE)
+lgb.plot.importance(imp,top_n=50, measure="Gain")
+
+tree_interpretation <- lgb.interprete(lgb.model, test_lgb, 1:5)
+lgb.plot.interpretation(tree_interpretation[[1]], top_n = 10)
+```
+## XGBoost
+```{r}
+tr<-read_csv('train_new.csv')
+te<-read_csv("test_new.csv")
+y <- tr$transactionRevenue
+yte <- te$transactionRevenue 
+yte[is.na(yte)] <- 0
+grp_mean <- function(x, grp) ave(x, grp, FUN = function(x) mean(x, na.rm = TRUE))
+
+idx <- tr$date < ymd("20170701")
+id <- te[, "fullVisitorId"]
+tri <- 1:nrow(tr)
+
+tr_te <- tr %>%
+  bind_rows(te) %>% 
+  mutate(year = year(date) %>% factor(),
+         wday = wday(date) %>% factor(),
+         hour = hour(as_datetime(visitStartTime)) %>% factor(),
+         isMobile = ifelse(isMobile, 1L, 0L),
+         isTrueDirect = ifelse(isTrueDirect, 1L, 0L)) %>%
+  select(-date, -fullVisitorId, -visitId, -hits, -visitStartTime) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate(pageviews_mean_vn = grp_mean(pageviews, visitNumber),
+         pageviews_mean_country = grp_mean(pageviews, country)) %T>% 
+  glimpse()
+
+rm(tr, te, tr_ae, te_ae); invisible(gc())
+
+tr_te_xgb <- tr_te %>% 
+  mutate_if(is.factor, as.integer) %>% 
+  glimpse()
+
+rm(tr_te); invisible(gc())
+
+dtest <- xgb.DMatrix(data = data.matrix(tr_te_xgb[-tri, ]))
+tr_te_xgb <- tr_te_xgb[tri, ]
+dtr <- xgb.DMatrix(data = data.matrix(tr_te_xgb[idx, ]), label = log1p(y[idx]))
+dval <- xgb.DMatrix(data = data.matrix(tr_te_xgb[!idx, ]), label = log1p(y[!idx]))
+dtrain <- xgb.DMatrix(data = data.matrix(tr_te_xgb), label = log1p(y))
+cols <- colnames(tr_te_xgb)
+rm(tr_te_xgb); invisible(gc)
+
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.05,
+          max_depth = 7,
+          min_child_weight = 5,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.7,
+          colsample_bylevel = 0.6,
+          nrounds = 2000)
+
+set.seed(0)
+m_xgb <- xgb.train(p, dtr, p$nrounds, list(val = dval), print_every_n = 100, early_stopping_rounds = 100)
+
+xgb.importance(cols, model = m_xgb) %>% 
+  xgb.plot.importance(top_n = 25)
+
+pred_xgb_tr <- predict(m_xgb, dtrain)
+pred_xgb <- predict(m_xgb, dtest) 
+sqrt(mean((yte - pred_xgb)^2))
+
+rm(dtr, dtrain, dval, dtest, m_xgb); invisible(gc)
+
+
+```
+
+

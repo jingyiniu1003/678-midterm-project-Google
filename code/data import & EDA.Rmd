@@ -1,0 +1,652 @@
+---
+title: " Google-revenue EDA "
+author: "Jingyi Niu"
+date: "2020/12/7"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(jsonlite)
+library(magrittr)
+library(purrr)
+library(ggplot2)
+library(gridExtra)
+library(countrycode)
+library(highcharter)
+library(ggExtra)
+library(skimr)
+library(cowplot)
+library(ggthemes)
+library(scales)
+library(ggpubr)
+```
+
+## 1.Read data
+
+#1.1 initialize variable name
+```{r}
+col_types <- cols(
+  channelGrouping = col_character(),
+  customDimensions = col_character(),
+  date = col_datetime(), # Parses YYYYMMDD
+  device = col_character(),
+  fullVisitorId = col_character(),
+  geoNetwork = col_character(),
+  hits = col_skip(), # MASSIVE amount of data!
+  #sessionId = col_character(), # not present in v2 comp; not used anwyay
+  socialEngagementType = col_skip(), # Skip as always "Not Socially Engaged"
+  totals = col_character(),
+  trafficSource = col_character(),
+  visitId = col_integer(), # visitId & visitStartTime look identical in all but 5000 cases
+  visitNumber = col_integer(),
+  visitStartTime = col_integer() # Convert to POSIXlt later,
+)
+```
+
+#1.2 Convert Python array/dictionary string to JSON format
+```{r}
+
+unsnake <- . %>%
+  str_replace_all(c("\\[\\]" = "[{}]", # empty element must contain dictionary
+                    "^\\[|\\]$" = "", # remove initial and final brackets
+                    "(\\[|\\{|, |: |', )'" = "\\1\"", # open single- to double-quote (on key or value)
+                    "'(\\]|\\}|: |, )" = '\"\\1')) # close quote
+
+separate_json <- . %>%
+  str_replace_all(c("\"[A-Za-z]+\": \"not available in demo dataset\"(, )?" = "",
+                    ", \\}" = "}")) %>% # if last property in list was removed
+  paste(collapse = ",") %>% paste("[", ., "]") %>% # As fromJSON() isn't vectorised
+  fromJSON(., flatten = TRUE)
+```
+
+#1.3 import data
+```{r}
+NMAX = Inf
+df <- 
+  bind_rows(
+    read_csv("train_v2.csv", col_types = col_types, n_max = NMAX) %>% mutate(test = F),
+    read_csv("test_v2.csv",  col_types = col_types, n_max = NMAX) %>% mutate(test = T)
+  ) %>%
+  bind_cols(separate_json(.$device))        %>% select(-device) %>%
+  bind_cols(separate_json(.$geoNetwork))    %>% select(-geoNetwork) %>%
+  bind_cols(separate_json(.$totals))        %>% select(-totals) %>%
+  bind_cols(separate_json(.$trafficSource)) %>% select(-trafficSource) %>%
+  bind_cols(separate_json(unsnake(.$customDimensions))) %>% select(-customDimensions)
+
+```
+
+#1.4 processing data
+```{r}
+# convert visitStartTime to POSIXct
+
+df <-      mutate(df,
+                  transactionRevenue = as.numeric(df$transactionRevenue),
+                  medium = as.factor(medium),
+                  campaign = as.factor(campaign),
+                  hits = as.numeric(df$hits),
+                  visits = as.numeric(visits),
+                  isTrueDirect = ifelse(isTrueDirect, 1, 0),
+                  pageviews = as.numeric(df$pageviews),
+                  day_of_week = weekdays(df$date),
+                  month = format(df$date, "%m"),
+                  year = format(df$date, "%Y"))
+
+gtrain <- filter(.data=df,test == FALSE)
+gtest <- filter(.data=df,test == TRUE)
+
+gtrain$visitStartTime <- as_datetime(gtrain$visitStartTime)
+gtest$visitStartTime <- as_datetime(gtest$visitStartTime)
+
+summary(gtrain)
+str(gtrain)
+```
+
+
+##2 Missing Values analysis
+
+```{r}
+options(repr.plot.height=4)
+NAcol <- which(colSums(is.na(gtrain)) > 0)
+NAcount <- sort(colSums(sapply(gtrain[NAcol], is.na)), decreasing = TRUE)
+NADF <- data.frame(variable=names(NAcount), missing=NAcount)
+NADF$PctMissing <- round(((NADF$missing/nrow(gtrain))*100),1)
+NADF %>%
+    ggplot(aes(x=reorder(variable, PctMissing), y=PctMissing)) +
+    geom_bar(stat='identity', fill='lightblue') + coord_flip(y=c(0,120)) +
+    labs(x="", y="Percent of missing value") +
+    geom_text(aes(label=paste0(NADF$PctMissing, "%"), hjust=-0.1))
+```
+In order to better understand the train dataset, checking the missing value would be important.
+There are 98.9% users did not make the transaction while looking the product pages. In addition, all
+advertisement variables have missing rate around 95.6%. This result suggests to remove advertisement
+variables from the set. Similarly, “keyword”, "isTrueDirect" and “referral path” from channel group also
+have high missing rate between 61.6% and 68.7%. Also, detailed information on geography of visitors
+such as “city”,“region” and "metro" miss approximately 54.6%, which implies a better analysis of transaction
+revenue on country level.
+
+##3 Data cleaning
+
+```{r}
+# Remove column that just have one kind and column with majority of NA
+cols_uniques_values = sapply(df, n_distinct)
+cols_to_remove = names(cols_uniques_values[cols_uniques_values == 1])
+cols_to_remove = cols_to_remove[cols_to_remove != 'visits'] #It's useful
+
+cols_to_remove = c(cols_to_remove, 
+                   'adwordsClickInfo.slot',
+                   'adwordsClickInfo.isVideoAd',
+                   'adwordsClickInfo.gclId',
+                   'adContent',
+                   'adwordsClickInfo.page',
+                   'adwordsClickInfo.adNetworkType',
+                   'keyword')
+
+train.df = select(gtrain, -one_of(cols_to_remove))
+test.df = select(gtest, -one_of(cols_to_remove))
+df <- select(df, -one_of(cols_to_remove))
+
+write.csv(train.df,"train_df.csv",row.names=FALSE)
+write.csv(test.df,"test_df.csv",row.names=FALSE)
+```
+
+
+##4 Exploratory Data Analysis
+
+#4.1 Transaction Revenue
+```{r}
+# range of time
+time_range <- range(train.df$date)
+print(time_range)
+# range of revenue
+rev_range <- round(range(train.df$transactionRevenue, na.rm=TRUE), 2)
+print(rev_range)
+summary(train.df$transactionRevenue)
+# transform into log scale
+train.df$transactionRevenue[is.na(train.df$transactionRevenue)] <- 0
+revenue <- log(train.df$transactionRevenue+1)
+revenue2 <- revenue[which(revenue!=0)]
+summary(revenue)
+summary(revenue2)
+
+# all target
+train.df %>%
+ggplot(aes(x=revenue, y=..density..))+
+  geom_histogram(fill='lightblue', na.rm=TRUE, bins=40)+
+  ggtitle("Target Histgram")
+
+# nonzero target
+train.df2 <- train.df %>% filter(train.df$transactionRevenue!=0)
+train.df2 %>% 
+  ggplot(aes(x=revenue2, y=..density..)) + 
+  geom_histogram(fill='lightblue', na.rm=TRUE, bins=40) + 
+  geom_density(aes(x=revenue2), fill='red', color='red', alpha=0.2, na.rm=TRUE) + 
+  labs(
+    title = 'Distribution of transaction revenue',
+    x = 'Natural log of transaction revenue'
+  )
+
+```
+For transaction revenue, “NA” value can be treated as 0 since “NA” means no revenue made
+during the single visit. 
+From the plot, it is clear that most target values are 0, and it is severely right skewed,
+thus I check the target value without 0s.
+For nonzero target, we transform the transaction revenue variable into log
+scale through “log1p” function in R. In the following table and histogram, log transaction revenue
+presents an approximately normal distribution.
+
+#4.2 Total revenue
+```{r}
+total_revenue = sum(train.df$transactionRevenue, na.rm = TRUE)
+visitors.df = filter(train.df, !is.na(transactionRevenue)) %>% 
+  group_by(fullVisitorId) %>% 
+  summarise(totalRevenue = sum(transactionRevenue),
+            have_revenue = ifelse(max(transactionRevenue)>0,1,0),
+            count = n(),
+            n_visits_by_user = sum(visits),
+            impact = sum(transactionRevenue)/total_revenue)
+
+visitors.df$totalRevenue[is.na(visitors.df$totalRevenue)] = 0
+visitors.df$impact[is.na(visitors.df$impact)] = 0
+
+visitors.df = arrange(visitors.df, totalRevenue)
+
+plot(density(visitors.df$totalRevenue))
+polygon(density(visitors.df$totalRevenue), col="lightblue")
+```
+
+#4.3 Device Attributes 
+```{r}
+#browser
+p1 <- train.df %>% 
+  group_by(browser) %>% 
+  summarise(counts =sum(visits), meanRevenue = round(mean(transactionRevenue),2)) %>% 
+  filter(counts >1000) %>%
+ggplot(aes(x= browser , y=counts )) +
+    geom_bar(stat='identity', fill='lightblue') + coord_flip(y=c(0,1500000)) +
+    labs(x="", y="visits:browser") +
+    geom_text(aes(label=paste0(counts), hjust=-0.1))
+
+p2 <- train.df %>% 
+  group_by(browser) %>% 
+  summarise(counts =sum(visits), meanRevenue = round(mean(transactionRevenue),2)) %>% 
+  filter(counts >1000) %>%
+ggplot(aes(x= browser , y=meanRevenue )) +
+    geom_bar(stat='identity', fill='pink')  + coord_flip() +
+    labs(x="", y="MeanRevenue:browser") +
+    geom_text(aes(label=paste0(meanRevenue), hjust=-0.1))
+
+#operating System
+ 
+
+p3 <- train.df %>% 
+  group_by(operatingSystem) %>% 
+  summarise(counts =sum(visits), meanRevenue =round(mean(transactionRevenue),2)) %>% 
+  filter(counts >500) %>%
+ggplot(aes(x= operatingSystem , y=counts )) +
+    geom_bar(stat='identity', fill='lightblue') + coord_flip(y=c(0,800000)) +
+    labs(x="", y="visits:OS") +
+    geom_text(aes(label=paste0(counts), hjust=-0.1))
+
+p4 <- train.df %>% 
+  group_by(operatingSystem) %>% 
+  summarise(counts =sum(visits), meanRevenue =round(mean(transactionRevenue),2)) %>% 
+  filter(counts >500) %>%
+ggplot(aes(x= operatingSystem , y=meanRevenue )) +
+    geom_bar(stat='identity', fill='pink')  + coord_flip() +
+    labs(x="", y="MeanRevenue:OS") +
+    geom_text(aes(label=paste0(meanRevenue), hjust=-0.1))
+
+#device Category
+
+p5 <- de_visit <- train.df %>% 
+  group_by(deviceCategory) %>% 
+  summarise(counts =sum(visits), meanRevenue =round(mean(transactionRevenue),2)) %>%
+ggplot(aes(x= deviceCategory , y=counts )) +
+    geom_bar(stat='identity', fill='lightblue') + coord_flip(y=c(0,1500000)) +
+    labs(x="", y="visits:category") +
+    geom_text(aes(label=paste0(counts), hjust=-0.1))
+
+p6 <- de_visit <- train.df %>% 
+  group_by(deviceCategory) %>% 
+  summarise(counts =sum(visits), meanRevenue =round(mean(transactionRevenue),2)) %>%
+ggplot(aes(x= deviceCategory , y=meanRevenue )) +
+    geom_bar(stat='identity', fill= 'pink')  + coord_flip() +
+    labs(x="", y="MeanRevenue:category") +
+    geom_text(aes(label=paste0(meanRevenue), hjust=-0.1))
+
+ggarrange(p1, p3, p5 + rremove("x.text"), 
+          ncol = 2, nrow = 2)
+
+ggarrange(p2, p4, p6 + rremove("x.text"), 
+          ncol = 2, nrow =2)
+```
+Device category contains desktop, mobile, and tablet. See above, we
+observe that most people prefer to use desktop to visit products and generate transaction revenues. On the other side, customers rarely placed orders on mobile and tablet devices since they are not as userfriendly as computers.
+
+In addition to device category usage, the operating system usage could also be an important
+factor when predict the revenue transaction. There are seven operating systems that have been recorded,
+windows, macintosh, android, ios, linux, chrome os, and windows phone. Although most people use
+windows to visit the system, macintosh users actually makes significantly more revenue transaction.Furthermore, It also confirms that mobile systems are less attractive to customers who
+plan to purchase products from G Store.
+
+Analysis on browser almostly leads to the same result as that on device and operating system.
+The main reason is that “Safari” visitors also used macintosh operating system, but “Chrome”
+outperforms “Windows” from operating system category on transaction revenue. This result let us
+believe that most Macbook users also Chrome as the dominant browser. 
+
+#4.4 GeoNetwork Attributes
+```{r}
+## continents
+p1 <- train.df %>% 
+  group_by(continent) %>% 
+  summarize(mean_revenue = mean(transactionRevenue)) %>% 
+  mutate(continent = reorder(continent, -mean_revenue)) %>% 
+  ggplot(aes(continent, mean_revenue)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+p2 <- train.df %>% 
+  group_by(continent) %>% 
+  summarize(visits = n()) %>% 
+  mutate(continent = reorder(continent, -visits)) %>% 
+  ggplot(aes(continent, visits)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+p3 <- train.df %>% 
+  group_by(continent) %>% 
+  summarize(total_revenue = sum(transactionRevenue)) %>% 
+  mutate(continent = reorder(continent, -total_revenue)) %>% 
+  ggplot(aes(continent, total_revenue)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+## countries
+p4 <- train.df %>% 
+  group_by(country) %>% 
+  summarize(mean_revenue = mean(transactionRevenue)) %>% 
+  mutate(country = reorder(country, -mean_revenue)) %>% 
+  top_n(10) %>%
+  ggplot(aes(country, mean_revenue)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + coord_flip() +
+  geom_text(aes(label=paste0(mean_revenue), hjust=-0.1))
+
+p5 <- train.df %>% 
+  group_by(country) %>% 
+  summarize(visits = n()) %>% 
+  mutate(country = reorder(country, -visits)) %>% 
+  top_n(10) %>%
+  ggplot(aes(country, visits)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + coord_flip() +
+  geom_text(aes(label=paste0(visits), hjust=-0.1))
+
+p6 <- train.df %>% 
+  group_by(country) %>% 
+  summarize(total_revenue = sum(transactionRevenue)) %>% 
+  mutate(country = reorder(country, -total_revenue)) %>% 
+  top_n(10) %>%
+  ggplot(aes(country, total_revenue)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + coord_flip() +
+  geom_text(aes(label=paste0(total_revenue), hjust=-0.1))
+
+ggarrange(p1,p2,p3 + rremove("x.text"), ncol=3)
+ggarrange(p4,p5,p6 + rremove("x.text"), ncol=3)
+
+## map
+
+#world <- map_data("world") %>% rename(country =region)
+#continent_map <- merge(train.df, world, by= "country",all = T)  
+           
+#map1 <- ggplot() +
+#        ggtitle("continent map") +
+#        geom_polygon(data = continent_map, aes(x = long, y = lat, group = group, fill = `mean_revenue`), 
+#                        color = "grey", size = 0.2, alpha = 1.6) + 
+#        geom_polygon(data = world, aes(x = long, y = lat, group = group),
+#                 color="black", fill="white", size = 0.2, alpha = 0.3) 
+
+highchart(type = "map") %>%
+  hc_add_series_map(worldgeojson,
+                    train.df %>% 
+                      group_by(country) %>% 
+                      summarise(revenue = sum(visitNumber)) %>% 
+                      ungroup() %>% 
+                      mutate(iso2 = countrycode(country, origin="country.name", destination="iso2c")),
+                    value = "revenue", joinBy = "iso2") %>%
+  hc_title(text = "visits by country") %>%
+  hc_tooltip(useHTML = TRUE, headerFormat = "",
+             pointFormat = "{point.country}: {point.revenue:.0f}") %>% 
+  hc_colorAxis(minColor = "white", maxColor = "blue", max= 5e3)
+
+highchart(type = "map") %>%
+  hc_add_series_map(worldgeojson,
+                    train.df %>% 
+                      group_by(country) %>% 
+                      summarise(revenue = sum(transactionRevenue)) %>% 
+                      ungroup() %>% 
+                      mutate(iso2 = countrycode(country, origin="country.name", destination="iso2c")),
+                    value = "revenue", joinBy = "iso2") %>%
+  hc_title(text = "log Revenue by country") %>%
+  hc_tooltip(useHTML = TRUE, headerFormat = "",
+             pointFormat = "{point.country}: {point.revenue:.0f}") %>% 
+  hc_colorAxis(minColor = "white", maxColor = "blue", max= 5e3)
+
+```
+Obviously, continent and country has great impact on revenue.
+
+#4.5 channel Grouping
+```{r}
+p1 <- train.df %>% 
+  group_by(channelGrouping) %>% 
+  summarize(mean_revenue = mean(transactionRevenue)) %>% 
+  mutate(channelGrouping = reorder(channelGrouping, -mean_revenue)) %>% 
+  ggplot(aes(channelGrouping, mean_revenue)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  geom_text(aes(label=paste0(round(mean_revenue)),angle = 90, hjust=-0.1))
+
+p2 <- train.df %>% 
+  group_by(channelGrouping) %>% 
+  summarize(visits = n()) %>% 
+  mutate(channelGrouping = reorder(channelGrouping, -visits)) %>% 
+  ggplot(aes(channelGrouping, visits)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  geom_text(aes(label=paste0(visits), angle = 90,hjust=-0.1))
+
+
+p3 <- train.df %>% 
+  group_by(channelGrouping) %>% 
+  summarize(total_revenue = sum(transactionRevenue)) %>% 
+  mutate(channelGrouping = reorder(channelGrouping, -total_revenue)) %>% 
+  ggplot(aes(channelGrouping, total_revenue)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  geom_text(aes(label=paste0(total_revenue), angle = 90, hjust=-0.1))
+  
+
+ggarrange(p1,p2,p3, ncol=3)
+
+# is true direct
+
+p4 <- train.df %>% 
+  group_by(isTrueDirect) %>%
+  summarize(mean_revenue = mean(transactionRevenue)) %>% 
+  mutate( isTrueDirect = reorder(isTrueDirect,-mean_revenue)) %>% 
+  ggplot(aes(isTrueDirect, mean_revenue)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  xlab("is true direct") +
+  ggtitle("mean revenue v.s. isTrueDirect") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  geom_text(aes(label=paste0(round(mean_revenue)),angle = 90, hjust=-0.1))
+
+
+p5 <- train.df %>% 
+  group_by(isTrueDirect) %>% 
+  summarize(visits = n()) %>% 
+  mutate(isTrueDirect = reorder(isTrueDirect, -visits)) %>% 
+  ggplot(aes(isTrueDirect, visits)) +
+  geom_bar(stat = "identity", fill="lightblue") +
+  xlab("is true direct") +
+  ggtitle("visits v.s. isTrueDirect") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  geom_text(aes(label=paste0(visits), angle = 90,hjust=-0.1))
+
+ggarrange(p4,p5)
+
+
+```
+Channels is one of the most important factor feature since it is defined by Google Analytics as
+how a customer come to the G Store website. It related to other variables such as “source”, “referral
+path” in the “channel grouping” group (See Appendix 1). Organic Search means that a customer arrive
+the G Store from a search engine; Social is related to any social media websites or apps; Referral means
+that a customer come from G Store’s advertisement on other websites.
+Organic Search is the main access to the G Store and this channel also contribute essential
+amount of revenue. Social path hardly can generate revenue even though it contributes around half
+number of sessions than Organic Search. It demonstrates that customer are less interested in placing
+orders after they redirect from the social media.
+However, the referral path outperforms any other channels: it generates most transaction revenue. This
+result indicates that referral path is the most useful channel for selling products from G Store.
+
+#4.6 Time series 
+```{r}
+#Visits by date, month and day
+
+date_wise <- train.df  %>% 
+group_by(date)  %>% 
+summarise(daily_visits = sum(visits, na.rm = TRUE),
+daily_hits = sum(hits, na.rm = TRUE),
+daily_pageviews = sum(pageviews, na.rm = TRUE),
+daily_newVisits = sum(as.numeric(newVisits), na.rm = TRUE),
+daily_transactionRevenue = sum(transactionRevenue, na.rm =TRUE)
+         )
+
+p1 <- ggplot(date_wise,aes(date,daily_visits)) + geom_line() +
+theme_economist(dkpanel=TRUE) +
+labs(title = "Time Series of Daily Visits",
+    x = "Date",
+    y = "Daily Visits") +
+geom_smooth() 
+
+p2 <- ggplot(date_wise,aes(date,daily_hits)) + geom_line() +
+theme_economist(dkpanel=TRUE) +
+labs(title = "Time Series of Daily Hits",
+    x = "Date",
+    y = "Daily Hits") +
+geom_smooth()
+
+p3 <- ggplot(date_wise,aes(date,daily_newVisits)) + geom_line() +
+theme_economist(dkpanel=TRUE) +
+labs(title = "Time Series Daily new Visits",
+    x = "Date",
+    y = "Daily new Visits") +
+geom_smooth()
+
+p4 <- ggplot(date_wise,aes(date,daily_pageviews)) + geom_line() +
+theme_economist(dkpanel=TRUE) +
+labs(title = "Time Series Daily Pageviews",
+    x = "Date",
+    y = "Daily new Visits") +
+geom_smooth()
+
+p5 <- ggplot(date_wise,aes(date,daily_transactionRevenue)) + geom_line() +
+theme_economist(dkpanel=TRUE) +
+labs(title = "Time Series of Daily Transaction Revenue",
+     #subtitle = "Bounce Rate = Bounces / Visits ",
+    x = "Date",
+    y = "Daily Transaction Revenue") +
+geom_smooth() 
+
+p1
+p2
+p3
+p4
+p5
+#ggarrange(p1,p2,p3,p4,p5, ncol=3,nrow=2)
+
+#visits numbers
+train.df %>% 
+  ggplot(mapping = aes(x=visitNumber, y=transactionRevenue))+
+  geom_point()+geom_jitter()+
+  theme(axis.text.x = element_text(angle=45))+
+  ggtitle("mean revenue v.s. visitNumber")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.title.x = element_text(face="bold",  size=15), axis.title.y = element_text(face="bold",  size=15),plot.title =    element_text(size=15, face="bold"),  axis.text.x  = element_text(angle=45,vjust=0.5, size=10))
+```
+p1 shows the trend of daily visit between 2016-2018.The trend is roughly smoothy, except the date from October 2016 to January 2017, there is a obvious convex curve. At the end of 2016, between November 2016 to December 2016, the daily visits
+increases significantly. Thus, we believe there were more people visits the product at the end of 2016. And in the end of 2017, there is a abrupt peak occured, which could be some external reason.
+
+p2 shows the trend of daily hits, from 2016 to 2018.
+The trend decreases significantly from 2016 to 2017 and rise a bit when turns to 2018. Therefore, we believe there are less and less customers that can be attracted and that could because of other competitors.
+
+p3 shows the trend of daily new visit between 2016-2018, it's basically the same with visits.
+
+p4 shows the trend of pageview from 2016 to 2018. Same as daily hits.
+
+See p5,although the daily transaction data are very volatile, it seems that a “high and low” pattern is
+regular over the year. Using the “smooth” function from ggplot2 in R, we observe a relatively stable
+trend from 2016 to 2018.
+#4.7 Page views
+```{r}
+summary(train.df$pageviews)
+
+p0 <- ggplot(train.df, aes(x=pageviews))+
+  geom_boxplot(col='blue') +  
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+p <- train.df %>% filter(!is.na(train.df$pageviews)) %>% 
+ggplot(aes(x=pageviews)) +
+    geom_histogram(fill='lightblue', binwidth=1) +
+    scale_y_continuous(breaks=seq(0, 500000, by=100000), label=comma) +
+    scale_x_continuous(breaks=seq(0, 50, by=5)) +
+    coord_cartesian(x=c(0,50))
+ ggarrange(p0, p)   
+
+#sessions with more than 30 pageviews all have very small frequencies. Since these are hardly visible, I will excluding them and excluding pageview NAs.
+
+p1 <- train.df %>% filter(!is.na(train.df$pageviews) & pageviews <=30) %>% 
+ggplot(aes(x=pageviews)) +
+    geom_histogram(fill='lightblue', binwidth=1) +
+    scale_y_continuous(breaks=seq(0, 500000, by=100000), label=comma) +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30))
+p2 <- train.df %>% filter(!is.na(train.df$pageviews) & pageviews <=30) %>% group_by(pageviews) %>%
+    ggplot(aes(x=pageviews, y=transactionRevenue)) +
+    geom_bar(stat='summary', fun.y = "sum", fill='lightblue') +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30)) + labs(y="sum of revenues")
+ggarrange(p1, p2)
+
+p3 <- train.df %>% filter(!is.na(train.df$pageviews) & pageviews <=30 & transactionRevenue>0) %>% 
+    ggplot(aes(x=pageviews)) +
+    geom_histogram(fill='light blue', binwidth=1) +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30)) +
+    labs(y='number of session with transaction revenue')
+
+p4 <- train.df %>% filter(!is.na(train.df$pageviews) & pageviews <=30 & transactionRevenue>0) %>% group_by(pageviews) %>%
+    ggplot(aes(x=pageviews, y=transactionRevenue)) +
+    geom_bar(stat='summary', fun.y = "mean", fill='blue') +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30)) + labs(y="mean of revenues") +
+    geom_label(stat = "count", aes(label = ..count..), y=0, size=2)
+
+p5 <- train.df %>% filter(!is.na(train.df$pageviews) & pageviews <=30 & transactionRevenue>0) %>% group_by(pageviews) %>%
+    ggplot(aes(x=pageviews, y=transactionRevenue)) +
+    geom_bar(stat='summary', fun.y = "median", fill='blue') +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30)) + labs(y="median of revenues") +
+    geom_label(stat = "count", aes(label = ..count..), y=0, size=2)
+
+
+train.df$transaction <- ifelse(train.df$transactionRevenue > 0, 1, 0)
+p6<- train.df %>% filter(!is.na(train.df$pageviews) & pageviews <=100) %>% group_by(pageviews) %>%
+summarize('sessions'= n(), 'transactions'= sum(transaction), 'pctTransactions'=round(x=((transactions/sessions)*100),digits=1)) %>%
+    ggplot(aes(x=pageviews, y=pctTransactions)) +
+    geom_bar(stat='identity', fill='blue') +
+    scale_x_continuous(breaks=seq(0, 100, by=5)) +
+    geom_smooth()
+ggarrange(p3,p4, p5,p6)
+```
+The first figure shows that the pageviews of customers. The right tail distribution indicates
+that most people view the product one to ten times. 
+
+The second figure shows the relationship between page views and revenue transaction. The
+histograms shows that people who view the page more than 10 times highly likely to make the
+transaction. If we only count pageviews with any transaction revenue, it leads to the same distribution.
+
+#4.8 Correlation matrix
+```{r}
+library(PerformanceAnalytics)
+
+chart.Correlation(train.df[,which(sapply(train.df, is.numeric))])
+```
+It shows that “hits” and “page views” has correlation of 0.98 which is near to 1, thus I
+select “page views” instead of hits. Since there are other number is siginificant, there may be collinearity. 
+
+
+
+
+
+
+
+
+
+
+
+
